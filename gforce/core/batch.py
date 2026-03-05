@@ -29,12 +29,14 @@ class JobConfig:
     gcs_bucket: str | None = None
     environment_variables: dict[str, str] | None = None
     service_account: str | None = None
+    use_custom_worker_image: bool = False
 
 
 class BatchJobBuilder:
     """Builds Cloud Batch job specifications."""
 
     DEFAULT_CONTAINER_IMAGE = "python:3.12-slim"
+    CUSTOM_WORKER_IMAGE = "worker"
 
     def __init__(self, config: GForceConfig | None = None):
         self.config = config or get_config()
@@ -316,6 +318,8 @@ def create_training_job(
     model_id: str | None = None,
     instance_prompt: str | None = None,
     num_steps: int = 1000,
+    hf_token: str | None = None,
+    use_custom_image: bool = True,
     config: GForceConfig | None = None,
 ) -> batch_v1.Job:
     """Create a DreamBooth training job.
@@ -340,33 +344,54 @@ def create_training_job(
     # Parse dataset path
     bucket_name = dataset_uri.replace("gs://", "").split("/")[0]
 
-    job_config = JobConfig(
-        job_name=job_name,
-        container_image="python:3.12-slim",  # Will use a custom image in production
-        command=[
+    # Determine container image
+    if use_custom_image:
+        # Use pre-built worker image from Artifact Registry
+        container_image = f"{cfg.gcp_region}-docker.pkg.dev/{cfg.gcp_project}/gforce/worker:latest"
+        # Custom image has entrypoint, so command is just args
+        command = [
+            "--mode", "train",
+            "--dataset", dataset_uri,
+            "--model", model,
+            "--output", output_name,
+            "--steps", str(num_steps),
+        ]
+    else:
+        # Use base Python image and run script manually
+        container_image = "python:3.12-slim"
+        command = [
             "python",
             "/mnt/disks/gcs/scripts/worker_init.py",
-            "--mode",
-            "train",
-            "--dataset",
-            dataset_uri,
-            "--model",
-            model,
-            "--output",
-            output_name,
-            "--steps",
-            str(num_steps),
-        ],
+            "--mode", "train",
+            "--dataset", dataset_uri,
+            "--model", model,
+            "--output", output_name,
+            "--steps", str(num_steps),
+        ]
+
+    # Build environment variables
+    env_vars = {
+        "INSTANCE_PROMPT": instance_prompt or "",
+        "MODEL_ID": model,
+        "OUTPUT_NAME": output_name,
+        "GCS_BUCKET": bucket_name,
+    }
+    
+    # Add HF_TOKEN if provided (for gated models)
+    if hf_token:
+        env_vars["HF_TOKEN"] = hf_token
+
+    job_config = JobConfig(
+        job_name=job_name,
+        container_image=container_image,
+        command=command,
         machine_type=cfg.machine_type,
         gpu_type=cfg.gpu_type,
         gpu_count=cfg.gpu_count,
         max_duration_seconds=cfg.max_run_duration,
         gcs_bucket=bucket_name,
-        environment_variables={
-            "INSTANCE_PROMPT": instance_prompt or "",
-            "MODEL_ID": model,
-            "OUTPUT_NAME": output_name,
-        },
+        environment_variables=env_vars,
+        use_custom_worker_image=use_custom_image,
     )
 
     client = BatchJobClient(cfg)
@@ -378,6 +403,8 @@ def create_inference_job(
     model_path: str | None = None,
     num_images: int = 10,
     output_prefix: str = "gen",
+    hf_token: str | None = None,
+    use_custom_image: bool = True,
     config: GForceConfig | None = None,
 ) -> batch_v1.Job:
     """Create a batch inference job.
@@ -397,31 +424,48 @@ def create_inference_job(
     job_name = f"gforce-gen-{output_prefix}-{int(__import__('time').time())}"
     job_name = job_name.replace("_", "-").lower()[:63]
 
-    job_config = JobConfig(
-        job_name=job_name,
-        container_image="python:3.12-slim",
-        command=[
+    # Determine container image
+    if use_custom_image:
+        container_image = f"{cfg.gcp_region}-docker.pkg.dev/{cfg.gcp_project}/gforce/worker:latest"
+        command = [
+            "--mode", "inference",
+            "--prompt", prompt,
+            "--num-images", str(num_images),
+            "--output-prefix", output_prefix,
+        ]
+    else:
+        container_image = "python:3.12-slim"
+        command = [
             "python",
             "/mnt/disks/gcs/scripts/worker_init.py",
-            "--mode",
-            "inference",
-            "--prompt",
-            prompt,
-            "--num-images",
-            str(num_images),
-            "--output-prefix",
-            output_prefix,
-        ],
+            "--mode", "inference",
+            "--prompt", prompt,
+            "--num-images", str(num_images),
+            "--output-prefix", output_prefix,
+        ]
+
+    # Build environment variables
+    env_vars = {
+        "GENERATION_PROMPT": prompt,
+        "MODEL_PATH": model_path or "",
+        "NUM_IMAGES": str(num_images),
+        "GCS_BUCKET": cfg.get_bucket_name(),
+    }
+    
+    if hf_token:
+        env_vars["HF_TOKEN"] = hf_token
+
+    job_config = JobConfig(
+        job_name=job_name,
+        container_image=container_image,
+        command=command,
         machine_type=cfg.machine_type,
         gpu_type=cfg.gpu_type,
         gpu_count=cfg.gpu_count,
         max_duration_seconds=cfg.max_run_duration,
         gcs_bucket=cfg.get_bucket_name(),
-        environment_variables={
-            "GENERATION_PROMPT": prompt,
-            "MODEL_PATH": model_path or "",
-            "NUM_IMAGES": str(num_images),
-        },
+        environment_variables=env_vars,
+        use_custom_worker_image=use_custom_image,
     )
 
     client = BatchJobClient(cfg)

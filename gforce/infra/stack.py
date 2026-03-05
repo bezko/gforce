@@ -25,6 +25,20 @@ def create_infrastructure(config: GForceConfig | None = None) -> dict:
 
     resources = {}
 
+    # Create Artifact Registry repository for Docker images
+    repository = gcp.artifactregistry.Repository(
+        "gforce-registry",
+        location=region,
+        repository_id="gforce",
+        description="G-Force ML worker images",
+        format="DOCKER",
+        labels={
+            "managed_by": "gforce",
+            "environment": cfg.pulumi_stack,
+        },
+    )
+    resources["artifact_registry"] = repository
+
     # Create GCS bucket for assets
     bucket_name = cfg.get_bucket_name()
     bucket = gcp.storage.Bucket(
@@ -136,6 +150,8 @@ def create_infrastructure(config: GForceConfig | None = None) -> dict:
     pulumi.export("service_account_email", service_account.email)
     pulumi.export("network_id", network.id)
     pulumi.export("subnet_id", subnet.id)
+    pulumi.export("artifact_registry_url", 
+                  pulumi.Output.concat(region, "-docker.pkg.dev/", project, "/gforce"))
 
     return resources
 

@@ -278,6 +278,17 @@ def train(
         "-s",
         help="Number of training steps",
     ),
+    hf_token: Optional[str] = typer.Option(
+        None,
+        "--hf-token",
+        help="HuggingFace token for gated models (or set HF_TOKEN env var)",
+        envvar="HF_TOKEN",
+    ),
+    use_custom_image: bool = typer.Option(
+        True,
+        "--custom-image/--no-custom-image",
+        help="Use pre-built worker image (faster) or install deps at runtime",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -313,6 +324,8 @@ def train(
                 model_id=model,
                 instance_prompt=prompt,
                 num_steps=steps,
+                hf_token=hf_token,
+                use_custom_image=use_custom_image,
                 config=config,
             )
         except Exception as e:
@@ -350,6 +363,17 @@ def gen(
         "-o",
         help="Output prefix for generated images",
     ),
+    hf_token: Optional[str] = typer.Option(
+        None,
+        "--hf-token",
+        help="HuggingFace token for gated models (or set HF_TOKEN env var)",
+        envvar="HF_TOKEN",
+    ),
+    use_custom_image: bool = typer.Option(
+        True,
+        "--custom-image/--no-custom-image",
+        help="Use pre-built worker image (faster) or install deps at runtime",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -379,6 +403,8 @@ def gen(
                 model_path=model,
                 num_images=num_images,
                 output_prefix=output_prefix,
+                hf_token=hf_token,
+                use_custom_image=use_custom_image,
                 config=config,
             )
         except Exception as e:

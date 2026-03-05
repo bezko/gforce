@@ -4,6 +4,9 @@ Worker initialization script for G-Force T4 VMs.
 
 This script runs inside the Batch job container on the GPU worker.
 It handles model caching, training, and inference tasks.
+
+Note: ML dependencies (torch, diffusers, etc.) are pre-installed in the Docker image
+for fast boot times. See Dockerfile in project root.
 """
 
 import argparse
@@ -30,113 +33,203 @@ HF_CACHE_PATH = Path("/tmp/huggingface")
 DEFAULT_MODEL = "TheImposterImposters/URPM-SD1.5-v2.3.inpainting"
 
 
-def install_dependencies() -> None:
-    """Install required ML dependencies."""
-    deps = [
-        "torch==2.1.2",
-        "torchvision",
-        "diffusers==0.25.0",
-        "transformers==4.36.0",
-        "accelerate==0.25.0",
-        "xformers==0.0.23.post1",
-        "bitsandbytes==0.41.3.post2",
-        "safetensors>=0.4.0",
-        "peft==0.7.1",
-        "huggingface-hub>=0.20.0",
-        "pillow>=10.0.0",
-    ]
+def get_hf_token() -> str | None:
+    """Get HuggingFace token from environment.
+    
+    Returns:
+        HF token or None if not set
+    """
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if token:
+        # Mask token for logging
+        masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
+        logger.info(f"HF_TOKEN found: {masked}")
+    else:
+        logger.info("No HF_TOKEN set - using open access models only")
+    return token
 
-    logger.info("Installing dependencies...")
-    for dep in deps:
-        logger.info(f"Installing {dep}...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", dep],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            logger.error(f"Failed to install {dep}: {result.stderr}")
-            raise RuntimeError(f"Failed to install {dep}")
 
-    logger.info("Dependencies installed successfully")
+def sync_model_from_gcs(
+    repo_id: str,
+    commit_hash: str | None = None,
+) -> Path | None:
+    """Sync model from GCS cache to local disk.
+    
+    Args:
+        repo_id: HuggingFace repo ID (e.g., "user/model")
+        commit_hash: Optional specific commit hash to sync
+        
+    Returns:
+        Path to local model directory if found in cache, None otherwise
+    """
+    bucket_name = os.environ.get("GCS_BUCKET")
+    if not bucket_name:
+        logger.warning("GCS_BUCKET not set, skipping GCS cache check")
+        return None
+    
+    # Build GCS cache path
+    safe_repo_id = repo_id.replace("/", "--")
+    gcs_cache_prefix = f"cache/models/huggingface/{safe_repo_id}"
+    
+    if commit_hash:
+        gcs_path = f"gs://{bucket_name}/{gcs_cache_prefix}/{commit_hash}/"
+        local_path = LOCAL_CACHE_PATH / f"{safe_repo_id}_{commit_hash}"
+    else:
+        # Try to find the latest cached version
+        gcs_path = f"gs://{bucket_name}/{gcs_cache_prefix}/"
+        local_path = LOCAL_CACHE_PATH / safe_repo_id
+    
+    # Check if cache exists in GCS
+    logger.info(f"Checking GCS cache: {gcs_path}")
+    result = subprocess.run(
+        ["gsutil", "-q", "ls", gcs_path],
+        capture_output=True,
+    )
+    
+    if result.returncode != 0:
+        logger.info(f"Model not found in GCS cache: {repo_id}")
+        return None
+    
+    # Sync from GCS to local
+    logger.info(f"Syncing model from GCS cache to {local_path}...")
+    local_path.mkdir(parents=True, exist_ok=True)
+    
+    sync_result = subprocess.run(
+        ["gsutil", "-m", "rsync", "-r", gcs_path, str(local_path)],
+        capture_output=True,
+        text=True,
+    )
+    
+    if sync_result.returncode != 0:
+        logger.error(f"Failed to sync from GCS: {sync_result.stderr}")
+        return None
+    
+    logger.info(f"✓ Model synced from GCS cache to {local_path}")
+    return local_path
+
+
+def sync_model_to_gcs(
+    local_path: Path,
+    repo_id: str,
+    commit_hash: str,
+) -> bool:
+    """Sync downloaded model to GCS cache.
+    
+    Args:
+        local_path: Local path to the model
+        repo_id: HuggingFace repo ID
+        commit_hash: Commit hash of the model version
+        
+    Returns:
+        True if sync successful
+    """
+    bucket_name = os.environ.get("GCS_BUCKET")
+    if not bucket_name:
+        logger.warning("GCS_BUCKET not set, skipping GCS cache upload")
+        return False
+    
+    safe_repo_id = repo_id.replace("/", "--")
+    gcs_path = f"gs://{bucket_name}/cache/models/huggingface/{safe_repo_id}/{commit_hash}/"
+    
+    logger.info(f"Uploading model to GCS cache: {gcs_path}")
+    
+    result = subprocess.run(
+        ["gsutil", "-m", "rsync", "-r", str(local_path), gcs_path],
+        capture_output=True,
+        text=True,
+    )
+    
+    if result.returncode != 0:
+        logger.error(f"Failed to upload to GCS cache: {result.stderr}")
+        return False
+    
+    # Save manifest
+    manifest = {
+        "provider": "huggingface",
+        "repo_id": repo_id,
+        "commit_hash": commit_hash,
+        "cached_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "gcs_path": gcs_path.rstrip("/"),
+    }
+    manifest_path = f"gs://{bucket_name}/cache/models/huggingface/{safe_repo_id}/{commit_hash}/manifest.json"
+    
+    manifest_result = subprocess.run(
+        ["gsutil", "cp", "-", manifest_path],
+        input=json.dumps(manifest, indent=2),
+        capture_output=True,
+        text=True,
+    )
+    
+    if manifest_result.returncode == 0:
+        logger.info(f"✓ Model cached to GCS: {gcs_path}")
+    else:
+        logger.warning(f"Model uploaded but manifest failed: {manifest_result.stderr}")
+    
+    return True
 
 
 def get_model_from_cache_or_download(
     model_id: str,
     cache_path: Path,
-) -> Path:
+) -> tuple[Path, bool]:
     """Get model from GCS cache or download from HuggingFace.
-
+    
     Args:
         model_id: HuggingFace model ID
         cache_path: Local path to check for cached model
-
+        
     Returns:
-        Path to the model
+        Tuple of (model_path, was_cached)
     """
     import torch
     from diffusers import StableDiffusionPipeline
-    from huggingface_hub import HfApi
-
-    # Check if we have a local cache
+    from huggingface_hub import HfApi, snapshot_download
+    
+    hf_token = get_hf_token()
+    
+    # Try GCS cache first
+    gcs_cached_path = sync_model_from_gcs(model_id)
+    if gcs_cached_path and gcs_cached_path.exists():
+        logger.info(f"Using GCS-cached model: {gcs_cached_path}")
+        return gcs_cached_path, True
+    
+    # Check local HF cache
     model_cache_key = model_id.replace("/", "--")
     local_model_path = cache_path / model_cache_key
-
+    
     if local_model_path.exists():
-        logger.info(f"Found local cache at {local_model_path}")
-        return local_model_path
-
+        logger.info(f"Found local HF cache at {local_model_path}")
+        return local_model_path, True
+    
     # Download from HuggingFace
     logger.info(f"Downloading model {model_id} from HuggingFace...")
-
-    # Use fp16 and CPU offload for T4 compatibility during download
-    dtype = torch.float16
-
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        safety_checker=None,
-        requires_safety_checker=False,
-    )
-
-    # Save to local cache
-    logger.info(f"Saving model to {local_model_path}")
-    local_model_path.mkdir(parents=True, exist_ok=True)
-    pipeline.save_pretrained(local_model_path)
-
-    return local_model_path
-
-
-def sync_model_to_gcs_cache(
-    local_path: Path,
-    gcs_cache_path: Path,
-) -> None:
-    """Sync downloaded model to GCS cache.
-
-    Args:
-        local_path: Local path to the model
-        gcs_cache_path: GCS path for caching
-    """
-    logger.info(f"Syncing model to GCS cache at {gcs_cache_path}...")
-
-    # Use gsutil for efficient sync
-    result = subprocess.run(
-        [
-            "gsutil",
-            "-m",
-            "rsync",
-            "-r",
-            str(local_path),
-            f"gs://{os.environ.get('GCS_BUCKET', 'gforce-assets')}/{gcs_cache_path}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        logger.warning(f"Failed to sync to GCS: {result.stderr}")
-    else:
-        logger.info("Model synced to GCS cache successfully")
+    
+    try:
+        # Get model info for caching
+        api = HfApi(token=hf_token)
+        model_info = api.model_info(model_id)
+        commit_hash = model_info.sha
+        logger.info(f"Model commit hash: {commit_hash}")
+        
+        # Download using snapshot_download for caching
+        downloaded_path = snapshot_download(
+            model_id,
+            cache_dir=str(cache_path),
+            token=hf_token,
+            resume_download=True,
+        )
+        
+        local_model_path = Path(downloaded_path)
+        logger.info(f"Model downloaded to {local_model_path}")
+        
+        # Upload to GCS cache for future runs
+        sync_model_to_gcs(local_model_path, model_id, commit_hash)
+        
+        return local_model_path, False
+        
+    except Exception as e:
+        logger.error(f"Failed to download model: {e}")
+        raise
 
 
 def train_dreambooth(
@@ -147,14 +240,14 @@ def train_dreambooth(
     num_steps: int = 1000,
 ) -> Path:
     """Run DreamBooth training.
-
+    
     Args:
         dataset_path: Path to training images
         model_id: Base model ID
         output_name: Output checkpoint name
         instance_prompt: Instance prompt (e.g., "photo of sks person")
         num_steps: Number of training steps
-
+        
     Returns:
         Path to the output checkpoint
     """
@@ -163,7 +256,6 @@ def train_dreambooth(
     from accelerate.utils import set_seed
     from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
     from diffusers.optimization import get_scheduler
-    from huggingface_hub import snapshot_download
     from PIL import Image
     from torch.utils.data import Dataset
     from transformers import CLIPTextModel, CLIPTokenizer
@@ -196,24 +288,30 @@ def train_dreambooth(
     # Set seed for reproducibility
     set_seed(42)
 
+    # Get model from cache or download
+    model_path, was_cached = get_model_from_cache_or_download(
+        model_id, LOCAL_CACHE_PATH
+    )
+    logger.info(f"Using model from: {model_path} (cached: {was_cached})")
+
     # Load models with fp16
     logger.info("Loading models...")
     tokenizer = CLIPTokenizer.from_pretrained(
-        model_id,
+        model_path,
         subfolder="tokenizer",
     )
     text_encoder = CLIPTextModel.from_pretrained(
-        model_id,
+        model_path,
         subfolder="text_encoder",
         torch_dtype=torch.float16,
     )
     vae = AutoencoderKL.from_pretrained(
-        model_id,
+        model_path,
         subfolder="vae",
         torch_dtype=torch.float16,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        model_id,
+        model_path,
         subfolder="unet",
         torch_dtype=torch.float16,
     )
@@ -391,13 +489,13 @@ def run_inference(
     output_prefix: str,
 ) -> list[Path]:
     """Run batch inference.
-
+    
     Args:
         prompt: Generation prompt
         model_path: Path to model checkpoint (uses default if None)
         num_images: Number of images to generate
         output_prefix: Prefix for output files
-
+        
     Returns:
         List of generated image paths
     """
@@ -414,9 +512,19 @@ def run_inference(
     # Load model
     model_id = model_path or DEFAULT_MODEL
     logger.info(f"Loading model from {model_id}...")
+    
+    # Get model from cache or download
+    if model_path and Path(model_path).exists():
+        model_load_path = Path(model_path)
+        logger.info(f"Using local model path: {model_load_path}")
+    else:
+        model_load_path, was_cached = get_model_from_cache_or_download(
+            model_id, LOCAL_CACHE_PATH
+        )
+        logger.info(f"Using model from: {model_load_path} (cached: {was_cached})")
 
     pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
+        model_load_path,
         torch_dtype=torch.float16,
         safety_checker=None,
         requires_safety_checker=False,
@@ -476,6 +584,13 @@ def main() -> int:
     logger.info(f"G-Force Worker starting...")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"GCS Bucket: {os.environ.get('GCS_BUCKET', 'not set')}")
+    
+    # Log HF token status (masked)
+    hf_token = get_hf_token()
+    if hf_token:
+        logger.info("HF_TOKEN: configured (gated models accessible)")
+    else:
+        logger.info("HF_TOKEN: not set (open models only)")
 
     # Check GCS mount
     if not GCS_MOUNT_PATH.exists():
@@ -483,13 +598,6 @@ def main() -> int:
         return 1
 
     logger.info(f"GCS mount available at {GCS_MOUNT_PATH}")
-
-    # Install dependencies
-    try:
-        install_dependencies()
-    except Exception as e:
-        logger.error(f"Failed to install dependencies: {e}")
-        return 1
 
     # Execute requested mode
     try:

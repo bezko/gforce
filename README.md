@@ -50,16 +50,40 @@ This will:
 - Configure Pulumi state backend
 - Deploy base infrastructure (VPC, Service Accounts, IAM)
 
-### 3. Run Training
+### 3. Build Worker Image (First Time Only)
+
+For faster VM boot times (~30 seconds instead of 3-5 minutes), build the pre-configured worker image:
+
+```bash
+# Build and push to Google Artifact Registry
+./scripts/build-worker-image.sh
+
+# Or with a specific tag
+./scripts/build-worker-image.sh v1.0
+```
+
+### 4. Run Training
 
 ```bash
 # Upload your dataset to GCS first
 gsutil -m cp -r ./my-dataset gs://gforce-assets-<project_id>/datasets/
 
-# Run DreamBooth training
+# Run DreamBooth training (uses custom image by default)
 uv run gforce train gs://gforce-assets-<project_id>/datasets/my-dataset \
   --output my-model \
   --prompt "photo of sks person"
+
+# For gated HuggingFace models, provide a token
+uv run gforce train gs://gforce-assets-<project_id>/datasets/my-dataset \
+  --output my-model \
+  --prompt "photo of sks person" \
+  --hf-token $HF_TOKEN
+
+# To use base Python image (slower, installs deps at runtime)
+uv run gforce train gs://gforce-assets-<project_id>/datasets/my-dataset \
+  --output my-model \
+  --prompt "photo of sks person" \
+  --no-custom-image
 ```
 
 ### 4. Check Status
@@ -87,6 +111,31 @@ uv run gforce pull my-model ./outputs
 | `gforce pull <output>` | Download outputs from GCS |
 | `gforce cache-list` | List cached models |
 | `gforce auth-status` | Check authentication |
+
+## Model Caching
+
+G-Force implements intelligent model caching to reduce download times and egress costs:
+
+1. **GCS Cache**: Downloaded models are automatically cached to `gs://<bucket>/cache/models/`
+2. **Cross-Run Sharing**: Models cached by one job are available to subsequent jobs
+3. **Commit-Based**: Cache keys include model commit hashes for version safety
+4. **Local Sync**: Models are synced from GCS to local VM disk for fast access
+
+Cache is automatically populated on first download and reused on subsequent runs.
+
+## HuggingFace Token
+
+For gated models (e.g., SDXL, specific checkpoints), provide your HuggingFace token:
+
+```bash
+# Via environment variable
+export HF_TOKEN=hf_...
+
+# Or via CLI flag
+uv run gforce train ... --hf-token hf_...
+```
+
+The token is securely passed to the worker VM and used for model downloads.
 
 ## Configuration
 

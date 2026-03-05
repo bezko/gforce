@@ -170,11 +170,12 @@ class PulumiStackManager:
         def pulumi_program():
             create_infrastructure(self.config)
 
+        # Note: work_dir is omitted when using inline program
+        # These are mutually exclusive in Pulumi Automation API
         stack = auto.create_or_select_stack(
             stack_name=self.stack_name,
             project_name=self.project_name,
             program=pulumi_program,
-            work_dir=self.work_dir,
         )
         return stack
 

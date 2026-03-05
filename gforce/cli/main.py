@@ -16,7 +16,6 @@ from gforce.core.auth import (
     check_auth_silent,
     get_auth_status_message,
     get_project_id,
-    require_auth,
     validate_adc,
 )
 from gforce.core.batch import (
@@ -197,7 +196,7 @@ def infra_up(
     ),
 ) -> None:
     """Deploy or update G-Force infrastructure."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     config = get_config()
 
@@ -226,7 +225,7 @@ def infra_down(
     ),
 ) -> None:
     """Destroy G-Force infrastructure."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     if not force:
         console.print(
@@ -297,7 +296,7 @@ def train(
     ),
 ) -> None:
     """Run DreamBooth training on a T4 GPU."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     config = get_config()
 
@@ -382,7 +381,7 @@ def gen(
     ),
 ) -> None:
     """Run batch inference on a T4 GPU."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     config = get_config()
 
@@ -426,7 +425,7 @@ def status(
     ),
 ) -> None:
     """Check status of G-Force jobs."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     config = get_config()
 
@@ -482,33 +481,71 @@ def pull(
         Path("./outputs"),
         help="Local destination directory",
     ),
+    use_gsutil: bool = typer.Option(
+        True,
+        "--gsutil/--gcs-client",
+        help="Use gsutil (faster for bulk) or GCS client (no external deps)",
+    ),
 ) -> None:
     """Download outputs from GCS to local directory."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     config = get_config()
     bucket_name = config.get_bucket_name()
-    source_path = f"gs://{bucket_name}/outputs/{output_name}/"
 
-    console.print(f"[bold]Downloading from {source_path}...[/bold]")
+    console.print(f"[bold]Downloading outputs/{output_name}...[/bold]")
 
     # Ensure destination exists
     destination.mkdir(parents=True, exist_ok=True)
+    local_output_dir = destination / output_name
+    local_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use gsutil for download
-    import subprocess
+    if use_gsutil:
+        # Use gsutil for download (faster for bulk transfers)
+        import shutil
+        import subprocess
 
-    result = subprocess.run(
-        ["gsutil", "-m", "cp", "-r", source_path, str(destination)],
-        capture_output=True,
-        text=True,
-    )
+        if not shutil.which("gsutil"):
+            console.print("[yellow]gsutil not found, falling back to GCS client[/yellow]")
+            use_gsutil = False
+        else:
+            source_path = f"gs://{bucket_name}/outputs/{output_name}/"
+            result = subprocess.run(
+                ["gsutil", "-m", "cp", "-r", source_path, str(destination)],
+                capture_output=True,
+                text=True,
+            )
 
-    if result.returncode != 0:
-        console.print(f"[red]✗ Download failed: {result.stderr}[/red]")
-        raise typer.Exit(1)
+            if result.returncode != 0:
+                console.print(f"[red]✗ Download failed: {result.stderr}[/red]")
+                raise typer.Exit(1)
 
-    console.print(f"[bold green]✓ Downloaded to {destination}/{output_name}/[/bold green]")
+            console.print(f"[bold green]✓ Downloaded to {local_output_dir}/[/bold green]")
+            return
+
+    # Fallback to GCS client
+    from google.cloud import storage
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    prefix = f"outputs/{output_name}/"
+
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    if not blobs:
+        console.print(f"[yellow]No files found at {prefix}[/yellow]")
+        raise typer.Exit(0)
+
+    downloaded = 0
+    with console.status(f"[bold green]Downloading {len(blobs)} files..."):
+        for blob in blobs:
+            # Preserve directory structure
+            rel_path = blob.name[len(prefix):]
+            local_file = local_output_dir / rel_path
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(local_file)
+            downloaded += 1
+
+    console.print(f"[bold green]✓ Downloaded {downloaded} files to {local_output_dir}/[/bold green]")
 
 
 @app.command()
@@ -529,7 +566,7 @@ def auth_status() -> None:
 @app.command()
 def cache_list() -> None:
     """List cached models in GCS."""
-    require_auth(lambda: None)()
+    validate_adc()
 
     config = get_config()
     cache = ModelCache(config)

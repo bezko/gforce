@@ -252,12 +252,14 @@ def train_dreambooth(
         Path to the output checkpoint
     """
     import torch
+    import torch.nn.functional as F
     from accelerate import Accelerator
     from accelerate.utils import set_seed
     from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
     from diffusers.optimization import get_scheduler
     from PIL import Image
     from torch.utils.data import Dataset
+    from torchvision import transforms
     from transformers import CLIPTextModel, CLIPTokenizer
 
     logger.info("Starting DreamBooth training...")
@@ -325,6 +327,13 @@ def train_dreambooth(
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
+    # Move VAE and text encoder to same device as UNet will be
+    # They are frozen so we don't need accelerator.prepare for them,
+    # but they must be on the correct device for the training loop
+    device = accelerator.device
+    vae = vae.to(device)
+    text_encoder = text_encoder.to(device)
+
     # Use 8-bit Adam optimizer
     import bitsandbytes as bnb
 
@@ -344,7 +353,13 @@ def train_dreambooth(
         num_training_steps=num_steps,
     )
 
-    # Prepare with accelerator
+    # Initialize noise scheduler for proper noise addition
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        model_path,
+        subfolder="scheduler",
+    )
+
+    # Prepare with accelerator (only UNet since VAE/text_encoder are frozen)
     unet, optimizer, lr_scheduler = accelerator.prepare(
         unet, optimizer, lr_scheduler
     )
@@ -377,6 +392,13 @@ def train_dreambooth(
             image = Image.open(self.instance_images[index]).convert("RGB")
             image = image.resize((self.size, self.size))
 
+            # Convert PIL Image to normalized tensor [-1, 1]
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ])
+            pixel_values = transform(image)
+
             # Tokenize prompt
             prompt = self.instance_prompt
             inputs = self.tokenizer(
@@ -388,7 +410,7 @@ def train_dreambooth(
             )
 
             return {
-                "pixel_values": image,
+                "pixel_values": pixel_values,
                 "input_ids": inputs.input_ids[0],
             }
 
@@ -406,31 +428,30 @@ def train_dreambooth(
 
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                latents = vae.encode(
-                    batch["pixel_values"]
-                ).latent_dist.sample()
+                # pixel_values is now a tensor, move to device
+                pixel_values = batch["pixel_values"].to(device=device, dtype=vae.dtype)
+                latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
 
-                # Sample timestep
+                # Sample timestep using scheduler's timesteps
                 timesteps = torch.randint(
                     0,
-                    1000,  # num_train_timesteps
+                    noise_scheduler.config.num_train_timesteps,
                     (bsz,),
                     device=latents.device,
                 )
                 timesteps = timesteps.long()
 
-                # Add noise to latents
-                noisy_latents = latents + noise * 0.5  # Simplified
+                # Add noise to latents using the scheduler (correct DDPM noise schedule)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get text embeddings
-                encoder_hidden_states = text_encoder(
-                    batch["input_ids"].unsqueeze(0)
-                )[0]
+                input_ids = batch["input_ids"].to(device=device)
+                encoder_hidden_states = text_encoder(input_ids.unsqueeze(0))[0]
 
                 # Predict noise
                 model_pred = unet(
@@ -440,7 +461,7 @@ def train_dreambooth(
                 ).sample
 
                 # Compute loss
-                loss = torch.nn.functional.mse_loss(model_pred, noise)
+                loss = F.mse_loss(model_pred, noise)
 
                 accelerator.backward(loss)
                 optimizer.step()

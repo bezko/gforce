@@ -1,0 +1,6 @@
+name: gforce
+runtime:
+  name: python
+  options:
+    toolchain: uv
+description: G-Force infrastructure - Disposable Compute for ML workflows on GCP

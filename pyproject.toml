@@ -1,0 +1,57 @@
+[project]
+name = "gforce"
+version = "0.1.0"
+description = "Disposable Compute orchestration engine for ML workflows on GCP"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "pulumi>=3.0.0",
+    "pulumi-gcp>=7.0.0",
+    "google-cloud-batch>=0.17.0",
+    "google-cloud-storage>=2.10.0",
+    "google-cloud-compute>=1.14.0",
+    "google-cloud-billing>=1.11.0",
+    "google-api-python-client>=2.100.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "mypy>=1.8.0",
+    "ruff>=0.2.0",
+    "types-requests>=2.31.0",
+    "responses>=0.24.0",
+]
+
+[project.scripts]
+gforce = "gforce.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --cov=gforce --cov-report=term-missing"

@@ -39,8 +39,15 @@ def validate_adc() -> tuple[Credentials, str | None]:
     try:
         credentials, project_id = google_auth_default()
         # Force token refresh to validate credentials
-        if credentials.expired or not credentials.valid:
-            if hasattr(credentials, "refresh"):
+        # Use hasattr checks for credential attributes that may not exist on all types
+        try:
+            expired = getattr(credentials, "expired", False)
+            valid = getattr(credentials, "valid", True)
+            needs_refresh = expired or not valid
+        except AttributeError:
+            needs_refresh = False
+        
+        if needs_refresh and hasattr(credentials, "refresh"):
                 from google.auth.transport.requests import Request
 
                 credentials.refresh(Request())

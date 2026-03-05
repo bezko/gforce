@@ -180,11 +180,10 @@ class ModelCache:
                 blob_path = f"{cache_path}/{relative_path}"
                 blob = self.bucket.blob(blob_path)
 
-                # Check if already exists
-                if blob.exists():
-                    existing = self.bucket.get_blob(blob_path)
-                    if existing and existing.size == local_file.stat().st_size:
-                        continue
+                # Check if already exists (get_blob returns None if not found)
+                existing = self.bucket.get_blob(blob_path)
+                if existing and existing.size == local_file.stat().st_size:
+                    continue
 
                 blob.upload_from_filename(local_file)
                 uploaded_count += 1

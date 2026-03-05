@@ -79,12 +79,6 @@ class BatchJobBuilder:
             memory_mib=15360,  # 15 GB
         )
 
-        # GPU requirement
-        accelerator = batch_v1.AllocationPolicy.Accelerator(
-            type_=job_config.gpu_type,
-            count=job_config.gpu_count,
-        )
-
         # Max run duration
         max_duration = duration_pb2.Duration(seconds=job_config.max_duration_seconds)
 

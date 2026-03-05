@@ -8,7 +8,7 @@ from google.api_core.extended_operation import ExtendedOperation
 from google.cloud import storage
 from google.cloud.storage import Bucket
 from rich.console import Console
-from google.api_core.extended_operation import ExtendedOperation
+from rich.panel import Panel
 
 from gforce.core.config import GForceConfig, get_config
 
